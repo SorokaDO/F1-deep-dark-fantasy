@@ -139,12 +139,12 @@ def build_standings(members: list[dict], prices: dict[str, float] | None = None)
 	return standings
 
 
-def render_standings(league_id: int, standings: list[dict], history: list[dict] | None = None) -> str:
+def render_standings(league_name: str, standings: list[dict], history: list[dict] | None = None) -> str:
 	history = history or []
 	chart_data = json.dumps(build_chart_data(standings, history), ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
 	poster_asset = Path(__file__).with_name("current-standings.B8mHwqMi.png")
 	poster_background = "data:image/png;base64," + base64.b64encode(poster_asset.read_bytes()).decode("ascii") if poster_asset.exists() else None
-	poster_data = json.dumps({"background": poster_background, "league": league_id,
+	poster_data = json.dumps({"background": poster_background, "league": league_name,
 		"entries": [{"code": standing["code"], "name": standing["name"], "points": standing["points"]}
 			for standing in standings]}, ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
 	rows = []
@@ -406,23 +406,25 @@ if (!posterData.background) {
 	 }
 	}
   const entries = posterData.entries;
-  const leader = entries.length ? entries[0].points : 0;
-  const largestGap = entries.length ? leader - entries[entries.length - 1].points : 0;
-  let previousY = 1220;
+	const carBodyLength = 102;
+	let centerY = 1053;
   entries.forEach((entry, index) => {
+	 if (index > 0) {
+		const pointDifference = Math.max(0, entries[index - 1].points - entry.points);
+		centerY -= Math.max(carBodyLength / 2, pointDifference / 200 * carBodyLength);
+	 }
    const color = colors[index % colors.length];
-   const proportionalY = 1080 - (largestGap ? (leader - entry.points) / largestGap : 0) * 850;
-   const centerY = Math.min(proportionalY, previousY - 135);
-   previousY = centerY;
-   const carX = index % 2 ? 625 : 590;
+   const leftSide = index % 2 === 0;
+   const carX = leftSide ? 485 : 660;
    drawCar(context, carX, centerY, color, index + 1);
-   context.fillStyle = '#0b0b0de8'; context.fillRect(403, centerY - 42, 153, 76);
-   context.fillStyle = color; context.fillRect(403, centerY - 42, 5, 76);
-   context.textAlign = 'left'; context.fillStyle = '#fff';
+   const labelX = leftSide ? 285 : 700;
+   context.fillStyle = '#0b0b0de8'; context.fillRect(labelX, centerY - 38, 150, 72);
+   context.fillStyle = color; context.fillRect(leftSide ? labelX + 145 : labelX, centerY - 38, 5, 72);
+   context.textAlign = leftSide ? 'right' : 'left'; context.fillStyle = '#fff';
    context.font = "800 38px 'Barlow Condensed', sans-serif";
-   context.fillText(entry.code, 420, centerY - 9, 125);
+   context.fillText(entry.code, leftSide ? labelX + 135 : labelX + 15, centerY - 8, 125);
    context.font = "600 30px 'Barlow Condensed', sans-serif";
-   context.fillText(numberFormat.format(entry.points), 420, centerY + 23, 125);
+   context.fillText(numberFormat.format(entry.points), leftSide ? labelX + 135 : labelX + 15, centerY + 23, 125);
   });
   context.fillStyle = '#101011'; context.fillRect(0, 1190, 1122, 212);
   context.fillStyle = '#ff302b'; context.fillRect(48, 1220, 88, 6);
@@ -430,13 +432,13 @@ if (!posterData.background) {
   context.font = "800 86px 'Barlow Condensed', sans-serif";
   context.fillText('CURRENT STANDINGS', 561, 1310, 1030);
   context.fillStyle = '#bcbcc2'; context.font = "600 28px 'Barlow', sans-serif";
-  context.fillText('F1 FANTASY / LEAGUE ' + posterData.league + ' / OVERALL', 561, 1364, 1000);
+  context.fillText('F1 FANTASY / ' + posterData.league + ' / OVERALL', 561, 1364, 1000);
   downloadPoster.disabled = false;
  };
  background.src = posterData.background;
  downloadPoster.addEventListener('click', () => {
   const link = document.createElement('a');
-  link.download = 'f1-standings-' + posterData.league + '.png';
+  link.download = 'f1-standings-' + posterData.league.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '.png';
   link.href = posterCanvas.toDataURL('image/png');
   link.click();
  });
@@ -444,12 +446,13 @@ if (!posterData.background) {
 </script>
 </body>
 </html>
-""".replace("__LEAGUE__", str(league_id)).replace("__COUNT__", str(len(standings))).replace("__ROWS__", "\n".join(rows)).replace("__HISTORY__", history_section).replace("__CHART_DATA__", chart_data).replace("__POSTER_DATA__", poster_data).replace("__COLORS__", json.dumps(PARTICIPANT_COLORS))
+""".replace("__LEAGUE__", escape(league_name)).replace("__COUNT__", str(len(standings))).replace("__ROWS__", "\n".join(rows)).replace("__HISTORY__", history_section).replace("__CHART_DATA__", chart_data).replace("__POSTER_DATA__", poster_data).replace("__COLORS__", json.dumps(PARTICIPANT_COLORS))
 
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="F1 Fantasy private league members and points.")
 	parser.add_argument("league_id", type=int)
+	parser.add_argument("--league-name", default="Private League", help="Display name used in the report instead of the league ID.")
 	args = parser.parse_args()
 	try:
 		members = get_members(args.league_id)
@@ -461,7 +464,7 @@ def main() -> None:
 		standings = build_standings(members, prices)
 		history = get_history(args.league_id)
 		output = Path(__file__).with_name("index.html")
-		output.write_text(render_standings(args.league_id, standings, history), encoding="utf-8")
+		output.write_text(render_standings(args.league_name, standings, history), encoding="utf-8")
 	except HTTPError as error:
 		sys.exit(f"F1 Fantasy HTTP error: {error.code}")
 	except (URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as error:
