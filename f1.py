@@ -1,0 +1,474 @@
+import argparse
+import base64
+from html import escape
+import json
+from pathlib import Path
+import sys
+import webbrowser
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+PARTICIPANT_COLORS = ["#ff5454", "#64d8ff", "#ffd66b", "#b5a2ff", "#62deb0", "#f5a1ce", "#ffffff", "#a6b26d"]
+
+
+def get_members(league_id: int, gameday_id: int = 0, phase_id: int = 1) -> list[dict]:
+	leaderboard_type = 2 if gameday_id else 1
+	url = (
+		"https://fantasy.formula1.com/feeds/leaderboard/privateleague/"
+		f"list_{leaderboard_type}_{league_id}_{gameday_id}_{phase_id}.json"
+	)
+	request = Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+	with urlopen(request, timeout=30) as response:
+		payload = json.load(response)
+	members = payload["Value"]["leaderboard"]
+	if not isinstance(members, list):
+		raise ValueError("API did not return a leaderboard. Check the league ID.")
+	return members
+
+
+def member_key(member: dict) -> tuple[str, int]:
+	return str(member.get("social_id", member["user_name"])), int(member.get("team_no", 0))
+
+
+def get_history(league_id: int) -> list[dict]:
+	request = Request(
+		"https://fantasy.formula1.com/feeds/v2/schedule/raceday_en.json",
+		headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+	)
+	with urlopen(request, timeout=30) as response:
+		fixtures = json.load(response)["Data"]["fixtures"]
+	rounds = {}
+	for fixture in fixtures:
+		if fixture["SessionType"] != "Race" or str(fixture["MatchStatus"]) != "4":
+			continue
+		gameday_id = int(fixture["GamedayId"])
+		rounds[gameday_id] = {
+			"id": gameday_id,
+			"phase": int(fixture["PhaseId"]),
+			"name": fixture["MeetingName"],
+			"label": fixture["CircuitLocation"],
+		}
+	history = []
+	for round_id in sorted(rounds):
+		round_data = rounds[round_id]
+		try:
+			members = get_members(league_id, round_id, round_data["phase"])
+		except HTTPError as error:
+			if error.code not in (403, 404):
+				raise
+			members = None
+			print(f"Historical results unavailable: {round_data['name']} (HTTP {error.code})", file=sys.stderr)
+		round_data["available"] = members is not None
+		round_data["ranks"] = {} if members is None else {
+			member_key(member): int(member["cur_rank"]) for member in members
+		}
+		round_data["points"] = {} if members is None else {
+			member_key(member): float(member["cur_points"]) for member in members
+		}
+		history.append(round_data)
+	return history
+
+
+def build_chart_data(standings: list[dict], history: list[dict]) -> dict:
+	series = [{"name": standing["name"], "code": standing["code"],
+		"race": {metric: [] for metric in ("points", "interval", "gap")},
+		"total": {metric: [] for metric in ("points", "interval", "gap")}}
+		for standing in standings]
+	totals = {}
+	complete = True
+	for round_data in history:
+		points = round_data.get("points", {})
+		complete = complete and round_data["available"]
+		for key, value in points.items():
+			totals[key] = totals.get(key, 0) + value
+		for mode, values in (("race", points), ("total", totals if complete else {})):
+			ordered = sorted(values, key=lambda key: values[key], reverse=True)
+			metrics = {}
+			for index, key in enumerate(ordered):
+				metrics[key] = {"points": values[key],
+					"interval": 0 if index == 0 else values[ordered[index - 1]] - values[key],
+					"gap": values[ordered[0]] - values[key]}
+			for standing, entry in zip(standings, series):
+				key = standing["key"]
+				for metric in ("points", "interval", "gap"):
+					value = metrics.get(key, {}).get(metric)
+					if key not in points:
+						value = None
+					entry[mode][metric].append(value)
+	return {"labels": [f"R{round_data['id']:02} {round_data['label']}" for round_data in history],
+		"series": series}
+
+
+def get_player_prices() -> dict[str, float]:
+	headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+	request = Request("https://fantasy.formula1.com/feeds/v2/apps/web_config.json", headers=headers)
+	with urlopen(request, timeout=30) as response:
+		gameday_id = int(json.load(response)["Data"]["constraints"]["GamedayId"])
+	request = Request(f"https://fantasy.formula1.com/feeds/drivers/{gameday_id}_en.json", headers=headers)
+	with urlopen(request, timeout=30) as response:
+		players = json.load(response)["Data"]["Value"]
+	return {str(player["PlayerId"]): float(player["Value"]) for player in players}
+
+
+def build_standings(members: list[dict], prices: dict[str, float] | None = None) -> list[dict]:
+	ordered = sorted(members, key=lambda member: float(member["cur_points"]), reverse=True)
+	standings = []
+	if not ordered:
+		return standings
+	leader_points = float(ordered[0]["cur_points"])
+	previous_points = leader_points
+	for position, member in enumerate(ordered, start=1):
+		name = member["user_name"].strip()
+		points = float(member["cur_points"])
+		team = member.get("user_team", [])
+		team_value = None
+		if prices is not None and len(team) == 7 and all(str(player_id) in prices for player_id in team):
+			team_value = sum(prices[str(player_id)] for player_id in team)
+		standings.append({
+			"key": member_key(member),
+			"position": position,
+			"name": name,
+			"code": name.split()[-1][:3].upper() if name else "---",
+			"points": points,
+			"team_value": team_value,
+			"interval": previous_points - points,
+			"gap": leader_points - points,
+		})
+		previous_points = points
+	return standings
+
+
+def render_standings(league_id: int, standings: list[dict], history: list[dict] | None = None) -> str:
+	history = history or []
+	chart_data = json.dumps(build_chart_data(standings, history), ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
+	poster_asset = Path(__file__).with_name("current-standings.B8mHwqMi.png")
+	poster_background = "data:image/png;base64," + base64.b64encode(poster_asset.read_bytes()).decode("ascii") if poster_asset.exists() else None
+	poster_data = json.dumps({"background": poster_background, "league": league_id,
+		"entries": [{"code": standing["code"], "name": standing["name"], "points": standing["points"]}
+			for standing in standings]}, ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
+	rows = []
+	for index, standing in enumerate(standings):
+		color = PARTICIPANT_COLORS[index % len(PARTICIPANT_COLORS)]
+		position = standing["position"]
+		interval = "&mdash;" if position == 1 else f"+{standing['interval']:g}"
+		gap = "&mdash;" if position == 1 else f"+{standing['gap']:g}"
+		team_value = standing.get("team_value")
+		value_text = "&mdash;" if team_value is None else f"${team_value:.1f}M"
+		rows.append(
+			f'<tr class="{"leader" if position == 1 else ""}">'
+			f'<td class="position">{position:02}</td>'
+			f'<th scope="row" title="{escape(standing["name"], quote=True)}">'
+			f'<span class="driver-name" style="--participant-color: {color}">'
+			f'<abbr title="{escape(standing["name"], quote=True)}">{escape(standing["code"])}</abbr></span></th>'
+			f'<td class="points">{standing["points"]:g}</td>'
+			f'<td class="team-value">{value_text}</td>'
+			f'<td class="interval">{interval}</td><td class="gap">{gap}</td></tr>'
+		)
+	if not rows:
+		rows.append('<tr><td colspan="6" class="empty">No participants</td></tr>')
+	history_headers = []
+	for round_data in history:
+		title = round_data["name"] + ("" if round_data["available"] else " - Results unavailable")
+		history_headers.append(
+			f'<th scope="col" title="{escape(title, quote=True)}">'
+			f'<span class="round-number">R{round_data["id"]:02}</span>{escape(round_data["label"])}</th>'
+		)
+	history_rows = []
+	for index, standing in enumerate(standings):
+		color = PARTICIPANT_COLORS[index % len(PARTICIPANT_COLORS)]
+		cells = []
+		for round_data in history:
+			rank = round_data["ranks"].get(standing["key"])
+			if rank is None:
+				title = "No result for this team" if round_data["available"] else "Results unavailable"
+				cells.append(f'<td class="missing" title="{title}">&mdash;</td>')
+			else:
+				podium_class = {1: "gold", 2: "silver", 3: "bronze"}.get(rank, "")
+				cells.append(f'<td class="{podium_class}">{rank}</td>')
+		history_rows.append(
+			f'<tr><th scope="row" title="{escape(standing["name"], quote=True)}">'
+			f'<span class="driver-name" style="--participant-color: {color}">'
+			f'{escape(standing["code"])}</span></th>{"".join(cells)}</tr>'
+		)
+	if not standings:
+		history_rows.append(f'<tr><td colspan="{len(history) + 1}" class="empty">No participants</td></tr>')
+	history_section = (
+		'<section class="history-section" aria-labelledby="history-title">'
+		'<h2 id="history-title">GRAND PRIX POSITIONS</h2>'
+		'<div class="history-scroll" tabindex="0" role="region" aria-label="Grand Prix positions">'
+		f'<table class="history" style="min-width: {80 * (len(history) + 1)}px" aria-label="Positions by points earned at each Grand Prix">'
+		f'<thead><tr><th scope="col">DRIVER</th>{"".join(history_headers)}</tr></thead>'
+		f'<tbody>{"".join(history_rows)}</tbody></table></div></section>'
+	) if history else '<section class="history-section"><h2>GRAND PRIX POSITIONS</h2><p class="empty">No completed Grand Prix</p></section>'
+	return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F1 Fantasy | League standings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+:root { --red: #ff302b; --bg: #101011; --text: #f5f5f5; --muted: #a4a4aa; --line: #333337; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Barlow', sans-serif; letter-spacing: 0; }
+body::before { content: ''; display: block; height: 6px; background: var(--red); }
+main { max-width: 780px; padding: 52px 32px; margin: 0 auto; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 28px; }
+.eyebrow { margin: 0 0 8px; color: var(--red); font-size: 12px; font-weight: 700; }
+h1 { margin: 0; font: italic 800 36px/1 'Barlow Condensed', sans-serif; }
+.flag { width: 48px; height: 32px; flex-shrink: 0; background: conic-gradient(#f5f5f5 25%, transparent 0 50%, #f5f5f5 0 75%, transparent 0) 0 0 / 16px 16px; transform: skew(-10deg); }
+.meta { display: flex; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
+col.rank { width: 8%; } col.driver { width: 14%; } col.score { width: 18%; } col.value { width: 22%; } col.delta { width: 19%; }
+thead th { padding: 14px 12px; color: var(--muted); font-size: 11px; font-weight: 600; text-align: right; border-bottom: 2px solid var(--red); }
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+tbody tr { border-bottom: 1px solid var(--line); animation: arrive .35s ease-out both; }
+tbody tr:nth-child(2) { animation-delay: .04s; } tbody tr:nth-child(3) { animation-delay: .08s; }
+tbody tr:nth-child(4) { animation-delay: .12s; } tbody tr:nth-child(5) { animation-delay: .16s; }
+tbody tr:nth-child(6) { animation-delay: .2s; }
+tbody td, tbody th { height: 72px; padding: 12px; text-align: right; overflow-wrap: anywhere; }
+tbody th { text-align: left; font: 700 30px/1 'Barlow Condensed', sans-serif; }
+abbr { text-decoration: none; cursor: default; }
+.driver-name { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.driver-name::before { content: ''; width: 3px; height: 1em; flex-shrink: 0; background: var(--participant-color); }
+.position { text-align: left; color: var(--muted); font: 600 20px 'Barlow Condensed', sans-serif; }
+.points { font: 700 28px 'Barlow Condensed', sans-serif; }
+.interval, .gap { font-size: 18px; font-weight: 500; }
+.interval { color: var(--muted); }
+.team-value { font: 600 20px 'Barlow Condensed', sans-serif; color: #c8d5df; white-space: nowrap; }
+.leader { background: #242426; }
+.leader th { color: var(--red); }
+.leader .position { box-shadow: inset 3px 0 var(--red); color: var(--text); }
+.empty { text-align: center; color: var(--muted); }
+.history-section { margin-top: 44px; }
+h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif; }
+.history-scroll { overflow-x: auto; scrollbar-color: var(--red) #242426; }
+.history-scroll:focus-visible { outline: 2px solid var(--red); outline-offset: 4px; }
+.history { border-collapse: separate; border-spacing: 0; }
+.history th, .history td { width: 80px; text-align: center; padding: 10px 6px; border-bottom: 1px solid var(--line); }
+.history thead th { vertical-align: top; height: 68px; border-bottom: 2px solid var(--red); }
+.history thead th:nth-child(2) { text-align: center; }
+.history th:first-child { width: 80px; position: sticky; left: 0; z-index: 1; background: var(--bg); text-align: left; box-shadow: 1px 0 var(--line); }
+.history tbody th { font-size: 25px; }
+.history tbody td { font: 600 24px 'Barlow Condensed', sans-serif; }
+.history .gold { color: #ffd66b; background: #332a16; }
+.history .silver { color: #e0e4eb; background: #2a2d33; }
+.history .bronze { color: #e5a575; background: #332319; }
+.history .missing { color: var(--muted); }
+.round-number { display: block; margin-bottom: 6px; color: var(--red); font-size: 10px; }
+@media (min-width: 768px) {
+ .history-section { width: calc(100vw - 64px); margin-left: calc((100% - (100vw - 64px)) / 2); }
+ .history { min-width: 0 !important; }
+ .history th, .history td { width: auto; }
+ .history tbody th, .history tbody td { font-size: 20px; }
+ .history thead th { font-size: 10px; }
+}
+.chart-section { margin-top: 44px; }
+.chart-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 20px; }
+.chart-controls fieldset { border: 1px solid var(--line); padding: 8px; margin: 0; display: flex; flex-wrap: wrap; gap: 10px; }
+.chart-controls legend { font-size: 11px; color: var(--muted); padding: 0 4px; }
+.chart-controls label { font-size: 13px; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.chart-controls input { accent-color: var(--red); }
+.chart-frame { position: relative; height: 360px; width: 100%; }
+.chart-status { color: var(--muted); font-size: 13px; }
+.poster-section { margin-top: 44px; }
+.poster-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+.poster-head h2 { margin: 0; }
+.download { background: var(--red); color: #fff; border: 0; border-radius: 4px; padding: 10px 14px; font: 600 13px 'Barlow', sans-serif; cursor: pointer; white-space: nowrap; }
+.download:disabled { opacity: .5; cursor: default; }
+.download:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+#standings-poster { display: block; width: 100%; height: auto; aspect-ratio: 1122 / 1402; }
+@keyframes arrive { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { tbody tr { animation: none; } }
+@media (max-width: 480px) {
+ main { padding: 28px 12px; }
+ h1 { font-size: 30px; }
+ header { padding-bottom: 24px; }
+ thead th { padding: 12px 4px; font-size: 10px; }
+ tbody td, tbody th { padding: 10px 4px; height: 64px; }
+ tbody th { font-size: 25px; }
+ .points { font-size: 24px; }
+ .position { font-size: 17px; }
+ .interval, .gap { font-size: 14px; }
+ .team-value { font-size: 16px; }
+ main > table tbody th { font-size: 18px; white-space: nowrap; }
+ main > table .points { font-size: 20px; white-space: nowrap; }
+ main > table .position { font-size: 14px; white-space: nowrap; }
+}
+</style>
+</head>
+<body>
+<main>
+<header><div><p class="eyebrow">F1 FANTASY</p><h1>LEAGUE STANDINGS</h1></div><div class="flag" aria-hidden="true"></div></header>
+<div class="meta"><span>LEAGUE __LEAGUE__</span><span>__COUNT__ ENTRIES &middot; OVERALL</span></div>
+<table aria-label="League standings. Intervals and leader gaps in points.">
+<colgroup><col class="rank"><col class="driver"><col class="score"><col class="value"><col class="delta"><col class="delta"></colgroup>
+<thead><tr><th scope="col">POS</th><th scope="col">DRIVER</th><th scope="col">POINTS</th><th scope="col" title="Current prices of the lineup shown in the leaderboard, excluding cash remaining">TEAM VALUE</th><th scope="col">INTERVAL</th><th scope="col">TO LEADER</th></tr></thead>
+<tbody>__ROWS__</tbody>
+</table>
+__HISTORY__
+<section class="chart-section" aria-labelledby="chart-title">
+<h2 id="chart-title">GAP TO LEADER</h2>
+<div class="meta"><span>Completed GP total</span><span>To leader</span></div>
+<div class="chart-frame"><canvas id="evolution" role="img" aria-label="Cumulative gap to leader after each completed Grand Prix"></canvas></div>
+<p class="chart-status" id="chart-status" role="status" hidden></p>
+</section>
+<section class="poster-section" aria-labelledby="poster-title">
+<div class="poster-head"><h2 id="poster-title">CURRENT STANDINGS</h2><button type="button" class="download" id="download-poster" disabled>Download PNG</button></div>
+<canvas id="standings-poster" width="1122" height="1402" role="img" aria-label="League participants represented by racing cars on a track, with surname abbreviations and total points"></canvas>
+<p class="chart-status" id="poster-status" role="status" hidden></p>
+</section>
+</main>
+<script id="chart-data" type="application/json">__CHART_DATA__</script>
+<script id="poster-data" type="application/json">__POSTER_DATA__</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+<script>
+const data = JSON.parse(document.getElementById('chart-data').textContent);
+const colors = __COLORS__;
+const numberFormat = new Intl.NumberFormat('en', {maximumFractionDigits: 2});
+if (typeof Chart === 'undefined' || !data.labels.length) {
+ const status = document.getElementById('chart-status');
+ status.hidden = false;
+ status.textContent = data.labels.length ? 'Chart could not load. Check your internet connection.' : 'No completed Grand Prix';
+} else {
+ new Chart(document.getElementById('evolution'), {
+	type: 'line', data: {labels: data.labels, datasets: data.series.map((entry, index) => ({
+	 label: entry.code, fullName: entry.name, data: entry.total.gap,
+	 borderColor: colors[index % colors.length], backgroundColor: colors[index % colors.length],
+	 borderWidth: 2, pointRadius: 3, pointHoverRadius: 6, spanGaps: false, tension: 0
+	}))},
+	options: {responsive: true, maintainAspectRatio: false,
+	 interaction: {mode: 'index', intersect: false},
+	 plugins: {legend: {position: 'bottom', labels: {color: '#f5f5f5', usePointStyle: true, boxWidth: 8}},
+		tooltip: {callbacks: {label: context => {
+		 const previous = context.dataset.data[context.dataIndex - 1];
+		 let delta = 'n/a';
+		 if (context.dataIndex > 0 && previous !== null && Number.isFinite(previous)) {
+			const difference = context.parsed.y - previous;
+			delta = (difference > 0 ? '+' : '') + numberFormat.format(difference);
+		 }
+		 return context.dataset.fullName + ': ' + context.formattedValue + ' pts (' + delta + ')';
+		}}}},
+	 scales: {x: {ticks: {color: '#a4a4aa', maxRotation: 0, autoSkip: true, maxTicksLimit: 6}, grid: {color: '#242426'}},
+		y: {reverse: true, min: 0, ticks: {color: '#a4a4aa'}, grid: {color: '#333337'}, title: {display: true, color: '#a4a4aa', text: 'Gap to leader (pts)'}}}}
+ });
+}
+const posterData = JSON.parse(document.getElementById('poster-data').textContent);
+const posterCanvas = document.getElementById('standings-poster');
+const downloadPoster = document.getElementById('download-poster');
+function posterError() {
+ const status = document.getElementById('poster-status');
+ status.hidden = false;
+ status.textContent = 'Poster background unavailable.';
+ posterCanvas.hidden = true;
+}
+function drawCar(context, centerX, centerY, color, position) {
+ context.save();
+ context.translate(centerX, centerY);
+ context.shadowColor = '#0009'; context.shadowBlur = 6; context.shadowOffsetX = 3;
+ context.fillStyle = '#101014';
+ for (const wheelX of [-27, 16]) {
+  for (const wheelY of [-34, 22]) context.fillRect(wheelX, wheelY, 11, 24);
+ }
+ context.fillRect(-24, -49, 48, 9);
+ context.fillRect(-27, 44, 54, 8);
+ context.fillStyle = color;
+ context.beginPath();
+ context.moveTo(-10, -43); context.lineTo(10, -43); context.lineTo(18, -12);
+ context.lineTo(13, 14); context.lineTo(5, 47); context.lineTo(-5, 47);
+ context.lineTo(-13, 14); context.lineTo(-18, -12); context.closePath(); context.fill();
+ context.shadowBlur = 0; context.shadowOffsetX = 0;
+ context.strokeStyle = '#ffffff99'; context.lineWidth = 2;
+ context.beginPath(); context.moveTo(0, 18); context.lineTo(0, 41); context.stroke();
+ context.fillStyle = '#121216'; context.beginPath(); context.ellipse(0, 0, 8, 14, 0, 0, Math.PI * 2); context.fill();
+ context.strokeStyle = '#dddddd'; context.beginPath(); context.arc(0, 2, 10, 0, Math.PI); context.stroke();
+ context.fillStyle = '#fff'; context.font = "bold 13px 'Barlow', sans-serif";
+ context.textAlign = 'center'; context.fillText(String(position), 0, -24);
+ context.restore();
+}
+if (!posterData.background) {
+ posterError();
+} else {
+ const background = new Image();
+ background.onerror = posterError;
+ background.onload = async () => {
+  await document.fonts.ready;
+  const context = posterCanvas.getContext('2d');
+  context.drawImage(background, 0, 0, 1122, 1402);
+	context.drawImage(background, 380, 340, 340, 370, 380, 180, 385, 970);
+	for (let row = 0; row < 2; row++) {
+	 for (let column = 0; column < 39; column++) {
+		context.fillStyle = (row + column) % 2 ? '#a6a6a6' : '#f2f2f2';
+		context.fillRect(338 + column * 11, 1118 + row * 10, 11, 10);
+	 }
+	}
+  const entries = posterData.entries;
+  const leader = entries.length ? entries[0].points : 0;
+  const largestGap = entries.length ? leader - entries[entries.length - 1].points : 0;
+  let previousY = 1220;
+  entries.forEach((entry, index) => {
+   const color = colors[index % colors.length];
+   const proportionalY = 1080 - (largestGap ? (leader - entry.points) / largestGap : 0) * 850;
+   const centerY = Math.min(proportionalY, previousY - 135);
+   previousY = centerY;
+   const carX = index % 2 ? 625 : 590;
+   drawCar(context, carX, centerY, color, index + 1);
+   context.fillStyle = '#0b0b0de8'; context.fillRect(403, centerY - 42, 153, 76);
+   context.fillStyle = color; context.fillRect(403, centerY - 42, 5, 76);
+   context.textAlign = 'left'; context.fillStyle = '#fff';
+   context.font = "800 38px 'Barlow Condensed', sans-serif";
+   context.fillText(entry.code, 420, centerY - 9, 125);
+   context.font = "600 30px 'Barlow Condensed', sans-serif";
+   context.fillText(numberFormat.format(entry.points), 420, centerY + 23, 125);
+  });
+  context.fillStyle = '#101011'; context.fillRect(0, 1190, 1122, 212);
+  context.fillStyle = '#ff302b'; context.fillRect(48, 1220, 88, 6);
+  context.fillStyle = '#fff'; context.textAlign = 'center';
+  context.font = "800 86px 'Barlow Condensed', sans-serif";
+  context.fillText('CURRENT STANDINGS', 561, 1310, 1030);
+  context.fillStyle = '#bcbcc2'; context.font = "600 28px 'Barlow', sans-serif";
+  context.fillText('F1 FANTASY / LEAGUE ' + posterData.league + ' / OVERALL', 561, 1364, 1000);
+  downloadPoster.disabled = false;
+ };
+ background.src = posterData.background;
+ downloadPoster.addEventListener('click', () => {
+  const link = document.createElement('a');
+  link.download = 'f1-standings-' + posterData.league + '.png';
+  link.href = posterCanvas.toDataURL('image/png');
+  link.click();
+ });
+}
+</script>
+</body>
+</html>
+""".replace("__LEAGUE__", str(league_id)).replace("__COUNT__", str(len(standings))).replace("__ROWS__", "\n".join(rows)).replace("__HISTORY__", history_section).replace("__CHART_DATA__", chart_data).replace("__POSTER_DATA__", poster_data).replace("__COLORS__", json.dumps(PARTICIPANT_COLORS))
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(description="F1 Fantasy private league members and points.")
+	parser.add_argument("league_id", type=int)
+	args = parser.parse_args()
+	try:
+		members = get_members(args.league_id)
+		try:
+			prices = get_player_prices()
+		except (URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as error:
+			prices = None
+			print(f"Team values unavailable: {error}", file=sys.stderr)
+		standings = build_standings(members, prices)
+		history = get_history(args.league_id)
+		output = Path(__file__).with_name("index.html")
+		output.write_text(render_standings(args.league_id, standings, history), encoding="utf-8")
+	except HTTPError as error:
+		sys.exit(f"F1 Fantasy HTTP error: {error.code}")
+	except (URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as error:
+		sys.exit(f"Could not retrieve league members: {error}")
+	print(output)
+	webbrowser.open(output.as_uri())
+
+
+if __name__ == "__main__":
+	main()
