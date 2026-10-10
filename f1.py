@@ -1,15 +1,23 @@
 import argparse
 import base64
+from datetime import datetime
 from html import escape
 import json
 from pathlib import Path
 import sys
 import webbrowser
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 
 PARTICIPANT_COLORS = ["#ff5454", "#64d8ff", "#ffd66b", "#b5a2ff", "#62deb0", "#f5a1ce", "#ffffff", "#a6b26d"]
+COUNTRY_CODES = {
+	"Australia": "AU", "China": "CN", "Japan": "JP", "United States": "US", "Canada": "CA",
+	"Monaco": "MC", "Spain": "ES", "Austria": "AT", "United Kingdom": "GB", "Belgium": "BE",
+	"Hungary": "HU", "Netherlands": "NL", "Italy": "IT", "Azerbaijan": "AZ", "Bahrain": "BH",
+	"Singapore": "SG", "Mexico": "MX", "Brazil": "BR", "Qatar": "QA", "United Arab Emirates": "AE",
+}
 
 
 def get_members(league_id: int, gameday_id: int = 0, phase_id: int = 1) -> list[dict]:
@@ -31,13 +39,52 @@ def member_key(member: dict) -> tuple[str, int]:
 	return str(member.get("social_id", member["user_name"])), int(member.get("team_no", 0))
 
 
-def get_history(league_id: int) -> list[dict]:
+def get_schedule_fixtures() -> list[dict]:
 	request = Request(
 		"https://fantasy.formula1.com/feeds/v2/schedule/raceday_en.json",
 		headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
 	)
 	with urlopen(request, timeout=30) as response:
-		fixtures = json.load(response)["Data"]["fixtures"]
+		return json.load(response)["Data"]["fixtures"]
+
+
+def get_weekend_schedule(fixtures: list[dict]) -> list[dict]:
+	race_fixtures = sorted(
+		(fixture for fixture in fixtures if fixture["SessionType"] == "Race"),
+		key=lambda fixture: int(fixture["GamedayId"]),
+	)
+	current_index = next(
+		(index for index, fixture in enumerate(race_fixtures) if int(fixture.get("GDIsCurrent", 0)) == 1),
+		next((index for index, fixture in enumerate(race_fixtures) if str(fixture.get("MatchStatus", "0")) != "4"), len(race_fixtures) - 1),
+	)
+	weekends = []
+	for offset, label in ((-1, "LAST GP"), (0, "THIS WEEKEND"), (1, "NEXT GP")):
+		index = current_index + offset
+		if not 0 <= index < len(race_fixtures):
+			continue
+		race = race_fixtures[index]
+		meeting_fixtures = [fixture for fixture in fixtures if fixture["MeetingId"] == race["MeetingId"]]
+		dates = []
+		for fixture in meeting_fixtures:
+			for key in ("SessionStartDateISO8601", "SessionEndDateISO8601"):
+				value = fixture.get(key)
+				if value:
+					dates.append(datetime.fromisoformat(value).date())
+				elif fixture.get("SessionStartDate"):
+					dates.append(datetime.strptime(fixture["SessionStartDate"], "%m/%d/%Y %H:%M:%S").date())
+		if not dates:
+			continue
+		start, end = min(dates), max(dates)
+		start_label = start.strftime("%b %d").replace(" 0", " ")
+		end_label = end.strftime("%b %d").replace(" 0", " ")
+		date_label = start_label if start == end else f"{start_label} - {end_label}"
+		weekends.append({"label": label, "name": race["MeetingName"], "country": race.get("CountryName", ""),
+			"dates": date_label, "current": offset == 0})
+	return weekends
+
+
+def get_history(league_id: int, fixtures: list[dict] | None = None) -> list[dict]:
+	fixtures = get_schedule_fixtures() if fixtures is None else fixtures
 	rounds = {}
 	for fixture in fixtures:
 		if fixture["SessionType"] != "Race" or str(fixture["MatchStatus"]) != "4":
@@ -70,6 +117,26 @@ def get_history(league_id: int) -> list[dict]:
 	return history
 
 
+def render_weekend_schedule(weekends: list[dict]) -> str:
+	if not weekends:
+		return ""
+	cards = []
+	for weekend in weekends:
+		modifier = "weekend-current" if weekend["current"] else "weekend-adjacent"
+		checkered_flag = '<span class="weekend-flag" aria-hidden="true"></span>' if weekend["label"] == "LAST GP" else ""
+		country = weekend.get("country", "")
+		country_code = COUNTRY_CODES.get(country)
+		country_flag = ""
+		if country_code:
+			country_flag = f'<img class="country-flag" src="https://flagcdn.com/w40/{country_code.lower()}.png" alt="{escape(country)} flag" width="24" height="16">'
+		cards.append(
+			f'<article class="weekend-card {modifier}"><p class="weekend-label">{weekend["label"]}{checkered_flag}</p>'
+			f'<h2>{country_flag}<span>{escape(weekend["name"])}</span></h2>'
+			f'<p class="weekend-dates">{escape(weekend["dates"])}</p></article>'
+		)
+	return f'<section class="weekend-schedule" aria-label="Grand Prix weekends">{"".join(cards)}</section>'
+
+
 def build_chart_data(standings: list[dict], history: list[dict]) -> dict:
 	series = [{"name": standing["name"], "code": standing["code"],
 		"race": {metric: [] for metric in ("points", "interval", "gap")},
@@ -98,6 +165,57 @@ def build_chart_data(standings: list[dict], history: list[dict]) -> dict:
 					entry[mode][metric].append(value)
 	return {"labels": [f"R{round_data['id']:02} {round_data['label']}" for round_data in history],
 		"series": series}
+
+
+def render_latest_race_table(standings: list[dict], history: list[dict], chart_data: dict) -> str:
+	latest_index = next((index for index in range(len(history) - 1, -1, -1) if history[index]["available"]), None)
+	if latest_index is None:
+		return '<section class="race-section" aria-labelledby="race-title"><h2 id="race-title">LATEST GRAND PRIX</h2><p class="empty">No Grand Prix results available</p></section>'
+	if not standings:
+		return '<section class="race-section" aria-labelledby="race-title"><h2 id="race-title">LATEST GRAND PRIX</h2><p class="empty">No participants</p></section>'
+	round_data = history[latest_index]
+	points = round_data["points"]
+	highest_points = max(points.values(), default=None)
+	has_team_names = any(standing.get("team_name") for standing in standings)
+	series_by_key = {standing["key"]: entry for standing, entry in zip(standings, chart_data["series"])}
+	ordered = sorted(standings, key=lambda standing: points.get(standing["key"], float("-inf")), reverse=True)
+	rows = []
+	for position, standing in enumerate(ordered, start=1):
+		key = standing["key"]
+		score = points.get(key)
+		gaps = series_by_key[key]["total"]["gap"]
+		current_gap = gaps[latest_index]
+		previous_gap = gaps[latest_index - 1] if latest_index > 0 else None
+		delta = current_gap - previous_gap if current_gap is not None and previous_gap is not None else None
+		score_class = "race-points"
+		if score is not None and score == highest_points:
+			score_class += " race-best"
+		elif delta is not None and delta <= 0:
+			score_class += " race-improving"
+		elif delta is not None and delta > 0:
+			score_class += " race-worsening"
+		team_cell = f'<td class="race-team">{escape(standing["team_name"])}</td>' if has_team_names and standing.get("team_name") else ('<td class="race-team missing">&mdash;</td>' if has_team_names else "")
+		score_text = f"{score:g}" if score is not None else "&mdash;"
+		delta_text = (f"+{delta:g}" if delta > 0 else f"{delta:g}") if delta is not None else "&mdash;"
+		rows.append(
+			f'<tr><td class="position">{position:02}</td>'
+			f'<th scope="row" title="{escape(standing["name"], quote=True)}">'
+			f'<span class="driver-name" style="--participant-color: {PARTICIPANT_COLORS[(position - 1) % len(PARTICIPANT_COLORS)]}">'
+			f'{escape(standing["code"])}</span></th>{team_cell}'
+			f'<td class="{score_class}">{score_text}</td><td class="race-delta">{delta_text}</td></tr>'
+		)
+	team_header = '<th scope="col">TEAM</th>' if has_team_names else ""
+	team_column = '<col class="race-team-column">' if has_team_names else ""
+	round_label = f"R{round_data['id']:02} {round_data['label']}"
+	return (
+		'<section class="race-section" aria-labelledby="race-title">'
+		'<h2 id="race-title">LATEST GRAND PRIX</h2>'
+		f'<p class="race-round">{escape(round_label)}</p>'
+		'<table class="race-table" aria-label="Points earned at the latest Grand Prix">'
+		f'<colgroup><col class="rank"><col class="driver">{team_column}<col class="score"><col class="delta"></colgroup>'
+		f'<thead><tr><th scope="col">POS</th><th scope="col">DRIVER</th>{team_header}<th scope="col">POINTS</th><th scope="col">DELTA</th></tr></thead>'
+		f'<tbody>{"".join(rows)}</tbody></table></section>'
+	)
 
 
 def get_player_prices() -> dict[str, float]:
@@ -130,6 +248,7 @@ def build_standings(members: list[dict], prices: dict[str, float] | None = None)
 			"position": position,
 			"name": name,
 			"code": name.split()[-1][:3].upper() if name else "---",
+			"team_name": unquote(str(member.get("team_name", ""))).strip(),
 			"points": points,
 			"team_value": team_value,
 			"interval": previous_points - points,
@@ -139,9 +258,13 @@ def build_standings(members: list[dict], prices: dict[str, float] | None = None)
 	return standings
 
 
-def render_standings(league_name: str, standings: list[dict], history: list[dict] | None = None) -> str:
+def render_standings(league_name: str, standings: list[dict], history: list[dict] | None = None,
+		weekends: list[dict] | None = None) -> str:
 	history = history or []
-	chart_data = json.dumps(build_chart_data(standings, history), ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
+	chart_values = build_chart_data(standings, history)
+	chart_data = json.dumps(chart_values, ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
+	race_section = render_latest_race_table(standings, history, chart_values)
+	weekend_section = render_weekend_schedule(weekends or [])
 	poster_asset = Path(__file__).with_name("current-standings.B8mHwqMi.png")
 	poster_background = "data:image/png;base64," + base64.b64encode(poster_asset.read_bytes()).decode("ascii") if poster_asset.exists() else None
 	poster_data = json.dumps({"background": poster_background, "league": league_name,
@@ -219,8 +342,22 @@ main { max-width: 780px; padding: 52px 32px; margin: 0 auto; }
 header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 28px; }
 .eyebrow { margin: 0 0 8px; color: var(--red); font-size: 12px; font-weight: 700; }
 h1 { margin: 0; font: italic 800 36px/1 'Barlow Condensed', sans-serif; }
-.flag { width: 48px; height: 32px; flex-shrink: 0; background: conic-gradient(#f5f5f5 25%, transparent 0 50%, #f5f5f5 0 75%, transparent 0) 0 0 / 16px 16px; transform: skew(-10deg); }
+.flag { width: 48px; height: 32px; flex-shrink: 0; background: linear-gradient(to bottom, #0057b7 0 50%, #ffd700 50% 100%); box-shadow: 0 0 0 1px #ffffff30; transform: skew(-10deg); }
 .meta { display: flex; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 600; }
+.weekend-schedule { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1fr); align-items: stretch; gap: 10px; margin: 0 0 20px; }
+.weekend-card { position: relative; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); overflow: hidden; }
+.weekend-card h2 { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; font: 600 17px/1.1 'Barlow Condensed', sans-serif; }
+.weekend-card h2 > span:last-child { min-width: 0; }
+.country-flag { display: block; width: 24px; height: 16px; flex: 0 0 auto; object-fit: cover; border-radius: 2px; }
+.weekend-label { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 10px; font-weight: 700; }
+.weekend-dates { margin: 0; color: var(--muted); font-size: 12px; font-weight: 500; }
+.weekend-adjacent { background: #171719; }
+.weekend-adjacent h2, .weekend-adjacent .weekend-dates { color: #77777e; }
+.weekend-flag { width: 18px; height: 12px; flex: 0 0 auto; background: conic-gradient(#bdbdc2 25%, #242426 0 50%, #bdbdc2 0 75%, #242426 0) 0 0 / 6px 6px; transform: skew(-12deg); }
+.weekend-current { padding: 16px 18px; border-color: var(--red); background: #242426; }
+.weekend-current .weekend-label { color: var(--red); }
+.weekend-current h2 { font-size: 22px; }
+.weekend-current .weekend-dates { color: var(--text); font-weight: 600; }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
 col.rank { width: 8%; } col.driver { width: 14%; } col.score { width: 18%; } col.value { width: 22%; } col.delta { width: 19%; }
 thead th { padding: 14px 12px; color: var(--muted); font-size: 11px; font-weight: 600; text-align: right; border-bottom: 2px solid var(--red); }
@@ -259,6 +396,16 @@ h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif;
 .history .bronze { color: #e5a575; background: #332319; }
 .history .missing { color: var(--muted); }
 .round-number { display: block; margin-bottom: 6px; color: var(--red); font-size: 10px; }
+.race-section { margin-top: 44px; }
+.race-round { margin: -12px 0 14px; color: var(--muted); font-size: 13px; }
+.race-table col.rank { width: 8%; } .race-table col.driver { width: 18%; } .race-table col.race-team-column { width: 34%; } .race-table col.score { width: 20%; } .race-table col.delta { width: 20%; }
+.race-table thead th:nth-child(3), .race-table tbody td:nth-child(3) { text-align: left; }
+.race-table .race-team { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.race-table .race-points { font: 700 24px 'Barlow Condensed', sans-serif; }
+.race-table .race-best { color: #C017BD; }
+.race-table .race-improving { color: #27B933; }
+.race-table .race-worsening { color: #E4EB57; }
+.race-table .race-delta { color: var(--muted); font-size: 16px; font-weight: 600; }
 @media (min-width: 768px) {
  .history-section { width: calc(100vw - 64px); margin-left: calc((100% - (100vw - 64px)) / 2); }
  .history { min-width: 0 !important; }
@@ -287,6 +434,15 @@ h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif;
  main { padding: 28px 12px; }
  h1 { font-size: 30px; }
  header { padding-bottom: 24px; }
+ .weekend-schedule { gap: 6px; }
+ .weekend-card { padding: 10px 8px; }
+ .weekend-current { padding: 12px 10px; }
+ .weekend-card h2 { gap: 5px; font-size: 14px; }
+ .weekend-current h2 { font-size: 18px; }
+ .country-flag { width: 21px; height: 14px; }
+ .weekend-label { gap: 4px; font-size: 9px; }
+ .weekend-flag { width: 15px; height: 10px; background-size: 5px 5px; }
+ .weekend-dates { font-size: 10px; }
  thead th { padding: 12px 4px; font-size: 10px; }
  tbody td, tbody th { padding: 10px 4px; height: 64px; }
  tbody th { font-size: 25px; }
@@ -303,19 +459,21 @@ h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif;
 <body>
 <main>
 <header><div><p class="eyebrow">F1 FANTASY</p><h1>LEAGUE STANDINGS</h1></div><div class="flag" aria-hidden="true"></div></header>
+__WEEKENDS__
 <div class="meta"><span>LEAGUE __LEAGUE__</span><span>__COUNT__ ENTRIES &middot; OVERALL</span></div>
 <table aria-label="League standings. Intervals and leader gaps in points.">
 <colgroup><col class="rank"><col class="driver"><col class="score"><col class="value"><col class="delta"><col class="delta"></colgroup>
 <thead><tr><th scope="col">POS</th><th scope="col">DRIVER</th><th scope="col">POINTS</th><th scope="col" title="Current prices of the lineup shown in the leaderboard, excluding cash remaining">TEAM VALUE</th><th scope="col">INTERVAL</th><th scope="col">TO LEADER</th></tr></thead>
 <tbody>__ROWS__</tbody>
 </table>
-__HISTORY__
+__RACE_TABLE__
 <section class="chart-section" aria-labelledby="chart-title">
 <h2 id="chart-title">GAP TO LEADER</h2>
 <div class="meta"><span>Completed GP total</span><span>To leader</span></div>
 <div class="chart-frame"><canvas id="evolution" role="img" aria-label="Cumulative gap to leader after each completed Grand Prix"></canvas></div>
 <p class="chart-status" id="chart-status" role="status" hidden></p>
 </section>
+__HISTORY__
 <section class="poster-section" aria-labelledby="poster-title">
 <div class="poster-head"><h2 id="poster-title">CURRENT STANDINGS</h2><button type="button" class="download" id="download-poster" disabled>Download PNG</button></div>
 <canvas id="standings-poster" width="1122" height="1402" role="img" aria-label="League participants represented by racing cars on a track, with surname abbreviations and total points"></canvas>
@@ -446,7 +604,7 @@ if (!posterData.background) {
 </script>
 </body>
 </html>
-""".replace("__LEAGUE__", escape(league_name)).replace("__COUNT__", str(len(standings))).replace("__ROWS__", "\n".join(rows)).replace("__HISTORY__", history_section).replace("__CHART_DATA__", chart_data).replace("__POSTER_DATA__", poster_data).replace("__COLORS__", json.dumps(PARTICIPANT_COLORS))
+""".replace("__WEEKENDS__", weekend_section).replace("__LEAGUE__", escape(league_name)).replace("__COUNT__", str(len(standings))).replace("__ROWS__", "\n".join(rows)).replace("__RACE_TABLE__", race_section).replace("__HISTORY__", history_section).replace("__CHART_DATA__", chart_data).replace("__POSTER_DATA__", poster_data).replace("__COLORS__", json.dumps(PARTICIPANT_COLORS))
 
 
 def main() -> None:
@@ -462,9 +620,11 @@ def main() -> None:
 			prices = None
 			print(f"Team values unavailable: {error}", file=sys.stderr)
 		standings = build_standings(members, prices)
-		history = get_history(args.league_id)
+		fixtures = get_schedule_fixtures()
+		weekends = get_weekend_schedule(fixtures)
+		history = get_history(args.league_id, fixtures)
 		output = Path(__file__).with_name("index.html")
-		output.write_text(render_standings(args.league_name, standings, history), encoding="utf-8")
+		output.write_text(render_standings(args.league_name, standings, history, weekends), encoding="utf-8")
 	except HTTPError as error:
 		sys.exit(f"F1 Fantasy HTTP error: {error.code}")
 	except (URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as error:
