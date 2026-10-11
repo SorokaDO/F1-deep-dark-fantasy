@@ -636,6 +636,7 @@ def main() -> None:
 	parser = argparse.ArgumentParser(description="F1 Fantasy private league members and points.")
 	parser.add_argument("league_id", type=int)
 	parser.add_argument("--league-name", default="Private League", help="Display name used in the report instead of the league ID.")
+	parser.add_argument("--no-open", action="store_true", help="Do not open the generated page in a browser.")
 	args = parser.parse_args()
 	try:
 		members = get_members(args.league_id)
@@ -655,7 +656,8 @@ def main() -> None:
 	except (URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as error:
 		sys.exit(f"Could not retrieve league members: {error}")
 	print(output)
-	webbrowser.open(output.as_uri())
+	if not args.no_open:
+		webbrowser.open(output.as_uri())
 
 
 if __name__ == "__main__":
