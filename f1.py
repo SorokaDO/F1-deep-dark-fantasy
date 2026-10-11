@@ -178,6 +178,10 @@ def render_latest_race_table(standings: list[dict], history: list[dict], chart_d
 	highest_points = max(points.values(), default=None)
 	has_team_names = any(standing.get("team_name") for standing in standings)
 	series_by_key = {standing["key"]: entry for standing, entry in zip(standings, chart_data["series"])}
+	participant_colors = {
+		standing["key"]: PARTICIPANT_COLORS[index % len(PARTICIPANT_COLORS)]
+		for index, standing in enumerate(standings)
+	}
 	ordered = sorted(standings, key=lambda standing: points.get(standing["key"], float("-inf")), reverse=True)
 	rows = []
 	for position, standing in enumerate(ordered, start=1):
@@ -200,7 +204,7 @@ def render_latest_race_table(standings: list[dict], history: list[dict], chart_d
 		rows.append(
 			f'<tr><td class="position">{position:02}</td>'
 			f'<th scope="row" title="{escape(standing["name"], quote=True)}">'
-			f'<span class="driver-name" style="--participant-color: {PARTICIPANT_COLORS[(position - 1) % len(PARTICIPANT_COLORS)]}">'
+			f'<span class="driver-name" style="--participant-color: {participant_colors[key]}">'
 			f'{escape(standing["code"])}</span></th>{team_cell}'
 			f'<td class="{score_class}">{score_text}</td><td class="race-delta">{delta_text}</td></tr>'
 		)
@@ -343,6 +347,15 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 .eyebrow { margin: 0 0 8px; color: var(--red); font-size: 12px; font-weight: 700; }
 h1 { margin: 0; font: italic 800 36px/1 'Barlow Condensed', sans-serif; }
 .flag { width: 48px; height: 32px; flex-shrink: 0; background: linear-gradient(to bottom, #0057b7 0 50%, #ffd700 50% 100%); box-shadow: 0 0 0 1px #ffffff30; transform: skew(-10deg); }
+.header-actions { display: flex; align-items: center; gap: 14px; }
+.form-trigger { width: 48px; height: 48px; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; background: #fff; cursor: pointer; }
+.form-trigger img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.form-trigger:focus-visible, .form-close:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
+.form-dialog { width: min(640px, calc(100% - 24px)); max-width: none; max-height: calc(100% - 24px); padding: 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--text); }
+.form-dialog::backdrop { background: #000c; }
+.form-dialog-head { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.form-close { width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 4px; background: #242426; color: var(--text); font: 600 22px/1 'Barlow', sans-serif; cursor: pointer; }
+.form-dialog iframe { display: block; width: 100%; height: min(418px, calc(100dvh - 88px)); border: 0; background: #fff; }
 .meta { display: flex; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 600; }
 .weekend-schedule { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1fr); align-items: stretch; gap: 10px; margin: 0 0 20px; }
 .weekend-card { position: relative; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); overflow: hidden; }
@@ -428,6 +441,7 @@ h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif;
 .download:disabled { opacity: .5; cursor: default; }
 .download:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
 #standings-poster { display: block; width: 100%; height: auto; aspect-ratio: 1122 / 1402; }
+.site-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 32px; padding: 14px 0 4px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 500; }
 @keyframes arrive { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @media (prefers-reduced-motion: reduce) { tbody tr { animation: none; } }
 @media (max-width: 480px) {
@@ -458,7 +472,7 @@ h2 { margin: 0 0 20px; font: italic 700 24px/1.2 'Barlow Condensed', sans-serif;
 </head>
 <body>
 <main>
-<header><div><p class="eyebrow">F1 FANTASY</p><h1>LEAGUE STANDINGS</h1></div><div class="flag" aria-hidden="true"></div></header>
+<header><div><p class="eyebrow">F1 FANTASY</p><h1>LEAGUE STANDINGS</h1></div><div class="header-actions"><button class="form-trigger" type="button" id="open-form" aria-label="Open feedback form" title="Open feedback form"><img src="max%20nerd.png" alt=""></button><div class="flag" aria-hidden="true"></div></div></header>
 __WEEKENDS__
 <div class="meta"><span>LEAGUE __LEAGUE__</span><span>__COUNT__ ENTRIES &middot; OVERALL</span></div>
 <table aria-label="League standings. Intervals and leader gaps in points.">
@@ -479,7 +493,12 @@ __HISTORY__
 <canvas id="standings-poster" width="1122" height="1402" role="img" aria-label="League participants represented by racing cars on a track, with surname abbreviations and total points"></canvas>
 <p class="chart-status" id="poster-status" role="status" hidden></p>
 </section>
+<footer class="site-footer"><span>developed by Директор дощової гонки</span><span>2026</span></footer>
 </main>
+<dialog class="form-dialog" id="form-dialog" aria-label="Feedback form">
+<div class="form-dialog-head"><button class="form-close" type="button" id="close-form" aria-label="Close form">&times;</button></div>
+<iframe src="https://docs.google.com/forms/d/e/1FAIpQLSd-sQ6Hy8gti1nbIHb5oL9iCGivyJRbbuo4MBXFjtz9sfYyqQ/viewform?embedded=true" width="640" height="418" frameborder="0" marginheight="0" marginwidth="0" title="Feedback form">Loading...</iframe>
+</dialog>
 <script id="chart-data" type="application/json">__CHART_DATA__</script>
 <script id="poster-data" type="application/json">__POSTER_DATA__</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
@@ -487,6 +506,12 @@ __HISTORY__
 const data = JSON.parse(document.getElementById('chart-data').textContent);
 const colors = __COLORS__;
 const numberFormat = new Intl.NumberFormat('en', {maximumFractionDigits: 2});
+const formDialog = document.getElementById('form-dialog');
+document.getElementById('open-form').addEventListener('click', () => formDialog.showModal());
+document.getElementById('close-form').addEventListener('click', () => formDialog.close());
+formDialog.addEventListener('click', event => {
+ if (event.target === formDialog) formDialog.close();
+});
 if (typeof Chart === 'undefined' || !data.labels.length) {
  const status = document.getElementById('chart-status');
  status.hidden = false;
